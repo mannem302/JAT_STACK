@@ -1,0 +1,166 @@
+pipeline {
+    agent any
+    environment {
+        AWS_REGION = 'us-east-1'
+        GIT_REPO = 'https://github.com/mannem302/AnilKumar.git'
+        AWS_ACCESS_KEY = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+        AWS_SECRET_KEY = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    }
+    parameters {
+        choice(
+            name: 'BRANCH_NAME',
+            choices: [
+                'main',  // Default branches or provide a dynamic mechanism to fetch this
+                'Dev'
+            ],
+            description: 'Select the branch to build'
+        )
+        choice(
+            name: 'TERRAFORM_ACTION',
+            choices: ['apply', 'destroy'],
+            description: 'Select the Terraform action'
+        )
+    }
+    stages {
+        stage('Fetch Branches and Set Parameters') {
+            steps {
+                script {
+                    // Fetch branches from the repository dynamically (if needed)
+                    def branches = sh(
+                        script: "git ls-remote --heads ${GIT_REPO} | awk '{print \$2}' | sed 's|refs/heads/||'",
+                        returnStdout: true
+                    ).trim().tokenize("\n")
+
+                    // Update the BRANCH_NAME parameter dynamically (if needed)
+                    properties([
+                        parameters([
+                            choice(
+                                name: 'BRANCH_NAME',
+                                choices: branches.join('\n'),
+                                description: 'Select the branch to build'
+                            ),
+                            choice(
+                                name: 'TERRAFORM_ACTION',
+                                choices: ['apply', 'destroy'],
+                                description: 'Select the Terraform action'
+                            )
+                        ])
+                    ])
+                }
+            }
+        }
+
+        stage('Get IPs of Provisioned Servers') {
+            steps {
+                script {
+                    def getServerIP = { tagName ->
+                        def ip = sh(
+                            script: """
+                            aws ec2 describe-instances \
+                            --filters "Name=tag:Name,Values=${tagName}" \
+                            --query "Reservations[*].Instances[*].PublicIpAddress" \
+                            --output text \
+                            --region ${AWS_REGION}
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        if (!ip) {
+                            error "Failed to retrieve IP for ${tagName}. Ensure the instance is running and the tag is correct."
+                        }
+                        return ip
+                    }
+
+                    env.TERRAFORM_SERVER_IP = getServerIP('Terraform_Server')
+                    echo "Terraform Server IP: '${env.TERRAFORM_SERVER_IP}'"
+
+                    env.ANSIBLE_SERVER_IP = getServerIP('Ansible_Master')
+                    echo "Ansible Server IP: '${env.ANSIBLE_SERVER_IP}'"
+
+                    env.JENKINS_SERVER_IP = getServerIP('Jenkins_Server')
+                    echo "Jenkins Server IP: '${env.JENKINS_SERVER_IP}'"
+                }
+            }
+        }
+   
+        stage('Clone Repository') {
+            steps {
+                script {
+                    echo "Selected branch: ${params.BRANCH_NAME}"
+
+                    checkout([
+                        $class: 'GitSCM', 
+                        branches: [[name: "*/${params.BRANCH_NAME}"]],
+                        userRemoteConfigs: [[url: "${GIT_REPO}"]]
+                    ])
+                }
+            }
+        }
+
+        stage('Terraform Action') {
+            steps {
+                sshagent(['TA_CONNECT']) {
+                    script {
+                        def branchDir = "~/${env.JOB_NAME}/${params.BRANCH_NAME}"
+                        def Jen_Home="/var/jenkins_home"
+
+                        retry(3) {
+                            sh """
+                            ssh -o StrictHostKeyChecking=no ubuntu@${TERRAFORM_SERVER_IP} << EOF
+                            mkdir -p ${branchDir}
+                            scp -o StrictHostKeyChecking=no -i ~/private.pem ubuntu@${JENKINS_SERVER_IP}:${Jen_Home}/workspace/${env.JOB_NAME}/main.tf  ${branchDir}/main.tf
+                            scp -o StrictHostKeyChecking=no -i ~/private.pem ubuntu@${JENKINS_SERVER_IP}:${Jen_Home}/workspace/${env.JOB_NAME}/public_keypair.pub .
+                            sudo chown ubuntu:ubuntu ${branchDir}/main.tf
+                            sudo chown ubuntu:ubuntu ~/public_keypair.pub
+                            sudo chmod 755 ${branchDir}/main.tf
+                            cd ${branchDir}
+                            export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY}"
+                            export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_KEY}"
+                            terraform init
+                            terraform ${params.TERRAFORM_ACTION} --auto-approve=true
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Ansible Connect') {
+            when {
+                expression {
+                    return params.TERRAFORM_ACTION == 'apply'
+                }
+            }
+            steps {
+                sshagent(['TA_CONNECT']) {
+                    script {
+                       def branchDir = "~/${env.JOB_NAME}/${params.BRANCH_NAME}"
+                       def Jen_Home="/var/jenkins_home"
+                        retry(3) {
+                            sh """
+                            ssh -o StrictHostKeyChecking=no ubuntu@${ANSIBLE_SERVER_IP} << EOF
+                            mkdir -p ${branchDir}
+                            scp -o StrictHostKeyChecking=no -i ~/private.pem ubuntu@${JENKINS_SERVER_IP}:${Jen_Home}/workspace/${env.JOB_NAME}/playbook.yml ${branchDir}/playbook.yml
+                            scp -o StrictHostKeyChecking=no -i ~/private.pem ubuntu@${JENKINS_SERVER_IP}:${Jen_Home}/workspace/${env.JOB_NAME}/aws_ec2.yml .
+                            sudo chown ubuntu:ubuntu ${branchDir}/playbook.yml
+                            sudo chmod 755 ${branchDir}/playbook.yml
+                            cd ${branchDir}
+                            sleep 30
+                            export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY}"
+                            export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_KEY}"
+                            ansible-playbook -i ~/aws_ec2.yml playbook.yml
+                            """
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post {
+        failure {
+            echo 'Pipeline failed. Please check the logs for more details.'
+        }
+    always {
+        cleanWs()
+        }
+    }
+}
